@@ -7,7 +7,8 @@ ordinary stores against `__builtin_nontemporal_store` (which lowers to `STNP`
 on AArch64).
 
 Two stencils, two store variants, three thread-dispatch backends, one shared
-kernel body so the comparison is apples-to-apples.
+kernel body so the comparison is apples-to-apples. Written in C++17
+(`stencil.cpp`).
 
 ```
 make                 # build ./stencil          (Apple: needs `brew install libomp`)
@@ -15,6 +16,25 @@ make verify-asm      # confirm STNP is actually emitted (read this section!)
 ./launch.sh          # sweep sizes -> results.dat
 gnuplot plot.gp      # results.dat -> results.png
 ```
+
+### Code layout
+
+The hot path stays a single, readable expression while the store instruction
+and the stencil shape are resolved at compile time:
+
+* **`std::vector<double, AlignedAllocator<double>>`** — owning storage, 128-byte
+  aligned so each padded row starts on a cache-line boundary.
+* **`ArrayView<T>`** — a thin non-owning view; `a(x, y)` indexes `data[y*lda+x]`.
+  Its data pointer is `__restrict`, which is what lets the compiler assume the
+  input and output don't alias — drop it and the NT vectorisation disappears.
+* **`store_at<Store>()`** — `if constexpr` picks `__builtin_nontemporal_store`
+  vs. an ordinary store with no runtime branch.
+* **stencils are stateless lambdas** (`stencil_jacobi`, `stencil_nine`) taking a
+  generic `const auto& a`; they inline into the kernel's inner loop.
+* **`apply_band<Store, F>()`** is the one generic engine; four one-line
+  `extern "C"` instantiations (`k_jacobi_nt`, …) give it clean, greppable
+  symbol names so a single function-pointer type serves every backend and
+  `make verify-asm` can find them.
 
 Single run:
 
@@ -74,11 +94,11 @@ This is the crux of your question, so, concretely:
 > band-per-thread decomposition. Do _not_ collapse the loops, and do _not_ use
 > dynamic scheduling.**
 
-```c
+```cpp
 #pragma omp parallel for schedule(static)      // the recommended form
 for (size_t y = 1; y < ny - 1; ++y)
     for (size_t x = 1; x < nx - 1; ++x)        // full unit-stride row, vectorised
-        B[y*lda + x] = stencil(A, x, y);
+        store_at<S>(&out(x, y), stencil(in, x, y));
 ```
 
 Reasoning:
@@ -142,10 +162,16 @@ The `gcd` backend uses `dispatch_apply_f` as a parallel for-loop, dispatching
 each invocation streams over its own large slab — the same decomposition as the
 OpenMP path:
 
-```c
+```cpp
 dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-dispatch_apply_f(nbands, q, &task, gcd_band);   // gcd_band computes band i
+dispatch_apply_f(nbands, q, &ctx, gcd_band);   // gcd_band computes band i
 ```
+
+`dispatch_apply_f` takes a plain `void(*)(void*, size_t)`, so a capturing
+lambda can't be passed directly — the backend uses a small context struct, as
+in the C API. If you prefer, the block form
+`dispatch_apply(nbands, q, ^(size_t b){ … })` captures cleanly and is a one-line
+swap in `run_gcd()`.
 
 Notes:
 
@@ -175,7 +201,7 @@ inconclusive.
 
 This benchmark works around it with an explicit interleave hint on every kernel:
 
-```c
+```cpp
 #pragma clang loop interleave_count(4)   // forces the pairing STNP needs
 ```
 
@@ -218,7 +244,9 @@ compiler that lacks the builtin entirely.
 
 ## Portability
 
-Builds and runs on non-Apple platforms for functional testing: without clang's
-builtin, `nt` falls back to an ordinary store (flagged at runtime); without
-OpenMP or GCD the backends run serially (also flagged). Correctness is verified
-on every platform. Only Apple Silicon exercises the real `STNP` path.
+C++17; the Makefile builds with `clang++` + Homebrew libomp + GCD on macOS and
+`g++` on Linux. It also builds and runs on non-Apple platforms for functional
+testing: without clang's builtin, `nt` falls back to an ordinary store (flagged
+at runtime); without OpenMP or GCD the backends run serially (also flagged).
+Correctness is verified on every platform. Only Apple Silicon exercises the real
+`STNP` path.

@@ -6,19 +6,19 @@
 #   make clean
 #
 # On Apple Silicon this needs Homebrew's libomp:  brew install libomp
-# Override any variable on the command line, e.g.  make CC=clang-18 ARCH=-mcpu=apple-m1
+# Override any variable on the command line, e.g.  make CXX=clang++ ARCH=-mcpu=apple-m1
 
 UNAME_S := $(shell uname -s)
 
 BIN := stencil
-SRC := stencil.c
-CFLAGS ?= -O3 -ffast-math -Wall -Wextra
+SRC := stencil.cpp
+CXXFLAGS ?= -std=c++17 -O3 -ffast-math -Wall -Wextra
 
 ifeq ($(UNAME_S),Darwin)
-  # --- Apple Silicon: clang + Homebrew libomp + Grand Central Dispatch --------
-  # (override the built-in default of `cc`, but honour an explicit make CC=...)
-  ifeq ($(origin CC),default)
-    CC := clang
+  # --- Apple Silicon: clang++ + Homebrew libomp + Grand Central Dispatch ------
+  # (override the built-in default of `c++`, but honour an explicit make CXX=...)
+  ifeq ($(origin CXX),default)
+    CXX := clang++
   endif
   ARCH     ?= -mcpu=apple-m2
   LIBOMP   := $(shell brew --prefix libomp 2>/dev/null)
@@ -26,17 +26,22 @@ ifeq ($(UNAME_S),Darwin)
   OMPLIBS  := -L$(LIBOMP)/lib -lomp
   EXTRA    := -DUSE_GCD
 else
-  # --- Linux / other: gcc (or clang) with its native OpenMP, no GCD -----------
-  ifeq ($(origin CC),default)
-    CC := gcc
+  # --- Linux / other: g++ (or clang++) with its native OpenMP, no GCD ---------
+  ifeq ($(origin CXX),default)
+    CXX := g++
   endif
   ARCH     ?= -march=native
   OMPFLAGS := -fopenmp
   OMPLIBS  := -fopenmp
-  EXTRA    := -Wno-pass-failed        # x86 clang can't vectorize scalar NT; harmless
+  EXTRA    :=
+  # x86 clang can't vectorize the scalar NT store and warns; g++ doesn't know
+  # the flag, so only pass it to a clang-based compiler.
+  ifneq (,$(findstring clang,$(CXX)))
+    EXTRA  += -Wno-pass-failed
+  endif
 endif
 
-BUILD := $(CC) $(CFLAGS) $(ARCH) $(OMPFLAGS) $(EXTRA)
+BUILD := $(CXX) $(CXXFLAGS) $(ARCH) $(OMPFLAGS) $(EXTRA)
 
 $(BIN): $(SRC) Makefile
 	$(BUILD) $(SRC) -o $@ $(OMPLIBS) -lm
