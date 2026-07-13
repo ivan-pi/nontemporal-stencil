@@ -15,12 +15,12 @@
 //  spills cache -- and slower while it still fits. The plot shows the crossover.
 //
 //  Kernels expose a plain C ABI (raw pointers) and use ArrayView internally.
-//  Backends split the strided (y) dimension into contiguous bands so each
-//  thread streams over one large slab -- ideal for full-cache-line NT writes.
-//  Run with --help for options.
+//  Backends (omp-for, gcd) split the strided (y) dimension into contiguous
+//  bands so each thread streams over one large slab. Run with --help.
 // ===========================================================================
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -28,8 +28,8 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <string>
-#include <string_view>
 #include <vector>
 #include <unistd.h>   // sysconf
 
@@ -46,47 +46,36 @@
 #include <sys/sysctl.h>
 #endif
 
-// Clang exposes the LLVM builtin; on AArch64 it becomes STNP. The token must be
-// preprocessor-guarded (not just behind `if constexpr`) so gcc still compiles.
+// Non-temporal store primitive. Clang's builtin becomes STNP on AArch64;
+// gcc / other targets fall back to an ordinary store (flagged at runtime).
 #if defined(__clang__) && defined(__has_builtin)
 #  if __has_builtin(__builtin_nontemporal_store)
 #    define HAVE_NT_STORE 1
 #  endif
 #endif
-
-// STNP is a *pair* instruction, so clang keeps the non-temporal hint only when
-// it can pair two adjacent vector stores. Under register pressure (the 9-point
-// kernel) the default heuristic fails to pair and silently downgrades to an
-// ordinary STP -- so "nt" would measure "std". An explicit interleave hint
-// makes STNP reliable for both kernels; confirm with `make verify-asm`.
-#define DO_PRAGMA(x) _Pragma(#x)
-#if defined(__clang__)
-#  define STENCIL_LOOP_HINT DO_PRAGMA(clang loop interleave_count(4))
+#ifdef HAVE_NT_STORE
+#  define NT_STORE(p, v) __builtin_nontemporal_store((v), (p))
 #else
-#  define STENCIL_LOOP_HINT
+#  define NT_STORE(p, v) (*(p) = (v))
 #endif
 
 // ---------------------------------------------------------------------------
-//  Storage: std::vector with a 128-byte-aligned allocator so each padded row
-//  (lda a multiple of 16 doubles) starts on a cache-line boundary.
+//  Storage: std::vector over-aligned to a cache line, so each padded row (lda a
+//  multiple of 16 doubles) starts on a 128-byte boundary. A tiny allocator is
+//  the only way to over-align a std::vector in standard C++.
 // ---------------------------------------------------------------------------
 template <class T>
 struct AlignedAllocator {
     using value_type = T;
-    static constexpr std::size_t alignment = 128;   // Apple Silicon cache line
-
     AlignedAllocator() = default;
-    template <class U>
-    AlignedAllocator(const AlignedAllocator<U> &) noexcept {}
+    template <class U> AlignedAllocator(const AlignedAllocator<U> &) noexcept {}
 
     T *allocate(std::size_t n) {
-        // std::aligned_alloc (C++17) requires the size to be a multiple of the
-        // alignment, so round up.
-        std::size_t bytes = (n * sizeof(T) + alignment - 1) / alignment * alignment;
-        if (void *p = std::aligned_alloc(alignment, bytes)) return static_cast<T *>(p);
-        throw std::bad_alloc();
+        return static_cast<T *>(::operator new(n * sizeof(T), std::align_val_t{128}));
     }
-    void deallocate(T *p, std::size_t) noexcept { std::free(p); }
+    void deallocate(T *p, std::size_t) noexcept {
+        ::operator delete(p, std::align_val_t{128});
+    }
 };
 template <class T, class U>
 bool operator==(const AlignedAllocator<T> &, const AlignedAllocator<U> &) noexcept { return true; }
@@ -123,19 +112,17 @@ enum class Store { Standard, NonTemporal };
 // Compile-time store policy: no runtime branch in the hot loop.
 template <Store S>
 inline void store_at(double *__restrict p, double v) noexcept {
-    if constexpr (S == Store::NonTemporal) {
-#ifdef HAVE_NT_STORE
-        __builtin_nontemporal_store(v, p);
-#else
-        *p = v;
-#endif
-    } else {
-        *p = v;
-    }
+    if constexpr (S == Store::NonTemporal) NT_STORE(p, v);
+    else                                   *p = v;
 }
 
 // One kernel per stencil, formula written inline. always_inline so the loop
 // (and its STNP) lands in the C-ABI entry point below, where verify-asm looks.
+//
+// The `clang loop interleave_count(4)` hint is required, not cosmetic: STNP is
+// a pair instruction, and without the hint clang fails to pair the 9-point
+// kernel's stores and silently emits ordinary STPs (i.e. "nt" == "std"). gcc
+// ignores the pragma and has no NT store anyway. Confirm with `make verify-asm`.
 template <Store S>
 [[gnu::always_inline]] inline void jacobi_band(
     const double *__restrict in, double *__restrict out,
@@ -143,7 +130,10 @@ template <Store S>
     ArrayView<const double> A(in, nx, ny, lda);
     ArrayView<double> Anew(out, nx, ny, lda);
     for (std::size_t y = y0; y < y1; ++y) {
-        _Pragma("omp simd") STENCIL_LOOP_HINT
+        #pragma omp simd
+        #ifdef __clang__
+        #pragma clang loop interleave_count(4)
+        #endif
         for (std::size_t x = 1; x < nx - 1; ++x)
             store_at<S>(&Anew(x, y),
                         0.25 * (A(x, y - 1) + A(x, y + 1) + A(x - 1, y) + A(x + 1, y)));
@@ -157,7 +147,10 @@ template <Store S>
     ArrayView<const double> A(in, nx, ny, lda);
     ArrayView<double> Anew(out, nx, ny, lda);
     for (std::size_t y = y0; y < y1; ++y) {
-        _Pragma("omp simd") STENCIL_LOOP_HINT
+        #pragma omp simd
+        #ifdef __clang__
+        #pragma clang loop interleave_count(4)
+        #endif
         for (std::size_t x = 1; x < nx - 1; ++x)
             store_at<S>(&Anew(x, y),
                         (1.0 / 16.0) * (4.0 * A(x, y)
@@ -197,17 +190,15 @@ static KernelFn select_kernel(Stencil s, Store st) {
 // ---------------------------------------------------------------------------
 //  Backends: split the strided dimension into contiguous bands of rows.
 // ---------------------------------------------------------------------------
-enum class Backend { OmpFor, OmpSpmd, Gcd };
+enum class Backend { OmpFor, Gcd };
 
 struct Band { std::size_t begin, end; };
 
 // Block i of [0, n) split into `parts` contiguous, near-equal pieces.
-[[maybe_unused]] static Band split(std::size_t n, int parts, int i) noexcept {
-    std::size_t q = n / static_cast<std::size_t>(parts);
-    std::size_t r = n % static_cast<std::size_t>(parts);
-    std::size_t ii = static_cast<std::size_t>(i);
-    std::size_t begin = ii * q + (ii < r ? ii : r);
-    return {begin, begin + q + (ii < r ? 1 : 0)};
+[[maybe_unused]] static Band split(std::size_t n, std::size_t parts, std::size_t i) noexcept {
+    std::size_t q = n / parts, r = n % parts;
+    std::size_t begin = i * q + (i < r ? i : r);
+    return {begin, begin + q + (i < r ? 1 : 0)};
 }
 
 // Worksharing loop over rows, default (static) schedule -> one contiguous band
@@ -223,20 +214,6 @@ static void run_omp_for(KernelFn k, const double *in, double *out, std::size_t n
 #endif
 }
 
-// SPMD: explicit parallel region, one contiguous band of rows per thread.
-static void run_omp_spmd(KernelFn k, const double *in, double *out, std::size_t nx,
-                         std::size_t ny, std::size_t lda, [[maybe_unused]] int nthreads) {
-#ifdef _OPENMP
-    #pragma omp parallel num_threads(nthreads)
-    {
-        auto [ys, ye] = split(ny - 2, omp_get_num_threads(), omp_get_thread_num());
-        k(in, out, nx, ny, lda, ys + 1, ye + 1);   // shift past the y=0 halo row
-    }
-#else
-    k(in, out, nx, ny, lda, 1, ny - 1);
-#endif
-}
-
 // Grand Central Dispatch: dispatch_apply_f runs gcd_band() once per band on a
 // concurrent queue. A high-QoS global queue keeps the work on performance
 // cores (DISPATCH_APPLY_AUTO would infer QoS from the caller instead).
@@ -245,12 +222,11 @@ struct GcdTask {
     KernelFn k;
     const double *in;
     double *out;
-    std::size_t nx, ny, lda;
-    int nbands;
+    std::size_t nx, ny, lda, nbands;
 };
 extern "C" void gcd_band(void *ctx, std::size_t b) {
     auto &t = *static_cast<GcdTask *>(ctx);
-    auto [ys, ye] = split(t.ny - 2, t.nbands, static_cast<int>(b));
+    auto [ys, ye] = split(t.ny - 2, t.nbands, b);
     t.k(t.in, t.out, t.nx, t.ny, t.lda, ys + 1, ye + 1);
 }
 #endif
@@ -258,9 +234,8 @@ extern "C" void gcd_band(void *ctx, std::size_t b) {
 static void run_gcd(KernelFn k, const double *in, double *out, std::size_t nx,
                     std::size_t ny, std::size_t lda, [[maybe_unused]] int nbands) {
 #ifdef HAVE_GCD
-    GcdTask t{k, in, out, nx, ny, lda, nbands};
-    dispatch_apply_f(static_cast<std::size_t>(nbands),
-                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &t, gcd_band);
+    GcdTask t{k, in, out, nx, ny, lda, static_cast<std::size_t>(nbands)};
+    dispatch_apply_f(t.nbands, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &t, gcd_band);
 #else
     k(in, out, nx, ny, lda, 1, ny - 1);   // GCD not compiled in -> serial fallback
 #endif
@@ -268,11 +243,8 @@ static void run_gcd(KernelFn k, const double *in, double *out, std::size_t nx,
 
 static void run_backend(Backend b, KernelFn k, const double *in, double *out,
                         std::size_t nx, std::size_t ny, std::size_t lda, int nthreads) {
-    switch (b) {
-        case Backend::OmpFor:  run_omp_for(k, in, out, nx, ny, lda, nthreads);  break;
-        case Backend::OmpSpmd: run_omp_spmd(k, in, out, nx, ny, lda, nthreads); break;
-        case Backend::Gcd:     run_gcd(k, in, out, nx, ny, lda, nthreads);      break;
-    }
+    if (b == Backend::OmpFor) run_omp_for(k, in, out, nx, ny, lda, nthreads);
+    else                      run_gcd(k, in, out, nx, ny, lda, nthreads);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +273,12 @@ static int default_threads() {
 }
 
 static void init_grid(ArrayView<double> A, ArrayView<double> B) {
+    assert(A.nx() == B.nx() && A.ny() == B.ny());
     const std::size_t nx = A.nx(), ny = A.ny();
+    const double denom = nx + ny;   // size_t -> double
     for (std::size_t y = 0; y < ny; ++y)
         for (std::size_t x = 0; x < nx; ++x) {
-            double v = static_cast<double>(x + y) / static_cast<double>(nx + ny);
+            double v = (x + y) / denom;
             A(x, y) = v;
             B(x, y) = v;   // keep B's halo equal to A's so the boundary stays fixed
         }
@@ -324,9 +298,7 @@ struct Config {
 
 static const char *name_of(Stencil s) { return s == Stencil::Jacobi ? "jacobi" : "nine"; }
 static const char *name_of(Store st)  { return st == Store::NonTemporal ? "nt" : "std"; }
-static const char *name_of(Backend b) {
-    return b == Backend::OmpFor ? "omp-for" : b == Backend::OmpSpmd ? "omp-spmd" : "gcd";
-}
+static const char *name_of(Backend b) { return b == Backend::OmpFor ? "omp-for" : "gcd"; }
 
 // ---------------------------------------------------------------------------
 //  Correctness check: backend+store output vs. a serial ordinary-store sweep.
@@ -377,13 +349,13 @@ static Result profile(const Config &cfg, Store store) {
         return std::chrono::duration<double>(clock::now() - t).count();
     };
 
-    // Warm up, then probe one sweep to size the trial to a ~50 ms budget.
+    // Warm up, then probe one sweep to size the trial to a ~300 ms budget.
     for (int w = 0; w < 3; ++w) sweep();
     auto probe = clock::now();
     sweep();
     double one = elapsed(probe);
     if (one <= 0.0) one = 1e-9;
-    int iters = std::clamp(static_cast<int>(0.05 / one), 3, cfg.iters);
+    int iters = std::clamp(int(0.3 / one), 3, cfg.iters);
 
     // Report the minimum over trials: least perturbed by OS jitter.
     double best = std::numeric_limits<double>::max();
@@ -394,8 +366,8 @@ static Result profile(const Config &cfg, Store store) {
     }
 
     const double per     = best / iters;
-    const double Nbyte   = static_cast<double>(nx) * static_cast<double>(ny) * sizeof(double);
-    const double updates = static_cast<double>(nx - 2) * static_cast<double>(ny - 2);
+    const double Nbyte   = double(nx) * double(ny) * sizeof(double);
+    const double updates = double(nx - 2) * double(ny - 2);
     return {per * 1e6,
             2.0 * Nbyte / per / 1e9,
             (store == Store::NonTemporal ? 2.0 : 3.0) * Nbyte / per / 1e9,
@@ -422,79 +394,67 @@ static void run_one(const Config &cfg, Store store) {
 // ---------------------------------------------------------------------------
 //  CLI
 // ---------------------------------------------------------------------------
+// Read the value following `arg` (parsed as T), else return `fallback`.
+template <class T>
+static T get_argval(char **begin, char **end, const std::string &arg, T fallback) {
+    char **it = std::find(begin, end, arg);
+    if (it != end && ++it != end) {
+        std::istringstream in(*it);
+        in >> fallback;
+    }
+    return fallback;
+}
+static bool get_arg(char **begin, char **end, const std::string &arg) {
+    return std::find(begin, end, arg) != end;
+}
+
 static void usage(const char *prog) {
     std::printf(
     "Usage: %s [options]\n\n"
-    "  -n, --size N        square grid, nx = ny = N        (default 4096)\n"
-    "      --nx N / --ny N rectangular grid\n"
-    "  -s, --stencil NAME  jacobi | nine                   (default jacobi)\n"
-    "  -b, --backend NAME  omp-for | omp-spmd | gcd         (default omp-for)\n"
-    "      --store WHICH   std | nt | both                 (default both)\n"
-    "  -t, --threads N     worker threads / GCD bands       (default P-cores)\n"
-    "  -i, --iters N       max timed sweeps per trial       (default 200)\n"
-    "      --trials N      timed trials, minimum reported   (default 5)\n"
-    "      --lda N         row stride (default nx -> mult of 16)\n"
-    "  -q, --quiet         emit only the CSV DATA line(s)\n"
-    "  -h, --help\n",
+    "  -n N            square grid, nx = ny = N          (default 4096)\n"
+    "  --nx N / --ny N rectangular grid\n"
+    "  -s NAME         stencil: jacobi | nine            (default jacobi)\n"
+    "  -b NAME         backend: omp-for | gcd            (default omp-for)\n"
+    "  --store WHICH   std | nt | both                   (default both)\n"
+    "  -t N            worker threads / GCD bands         (default P-cores)\n"
+    "  -i N            max timed sweeps per trial         (default 200)\n"
+    "  --trials N      timed trials, minimum reported     (default 5)\n"
+    "  --lda N         row stride (default nx -> mult of 16)\n"
+    "  -q              emit only the CSV DATA line(s)\n"
+    "  -h              this help\n",
     prog);
 }
 
 int main(int argc, char **argv) {
+    char **b = argv, **e = argv + argc;
+    if (get_arg(b, e, "-h") || get_arg(b, e, "--help")) { usage(argv[0]); return 0; }
+
     Config cfg;
-    std::vector<std::string_view> args(argv + 1, argv + argc);
+    cfg.nx      = get_argval(b, e, "-n", cfg.nx);
+    cfg.nx      = get_argval(b, e, "--nx", cfg.nx);
+    cfg.ny      = get_argval(b, e, "--ny", cfg.ny);   // 0 => square, set below
+    cfg.lda     = get_argval(b, e, "--lda", cfg.lda);
+    cfg.threads = get_argval(b, e, "-t", cfg.threads);
+    cfg.iters   = get_argval(b, e, "-i", cfg.iters);
+    cfg.trials  = get_argval(b, e, "--trials", cfg.trials);
+    cfg.quiet   = get_arg(b, e, "-q") || get_arg(b, e, "--quiet");
 
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        std::string_view a = args[i], key = a, inl;
-        if (auto eq = a.find('='); eq != std::string_view::npos) {
-            key = a.substr(0, eq);
-            inl = a.substr(eq + 1);
-        }
-        auto value = [&]() -> std::string_view {
-            if (!inl.empty()) return inl;
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "error: %.*s requires a value\n", (int)key.size(), key.data());
-                std::exit(EXIT_FAILURE);
-            }
-            return args[++i];
-        };
-        auto as_int  = [&] { return std::atoi(std::string(value()).c_str()); };
-        auto as_size = [&] { return static_cast<std::size_t>(std::strtoull(std::string(value()).c_str(), nullptr, 10)); };
-        auto bad = [&](const char *what, std::string_view v) {
-            std::fprintf(stderr, "error: unknown %s '%.*s'\n", what, (int)v.size(), v.data());
-            std::exit(EXIT_FAILURE);
-        };
+    std::string stencil = get_argval<std::string>(b, e, "-s", "jacobi");
+    std::string backend = get_argval<std::string>(b, e, "-b", "omp-for");
+    std::string store   = get_argval<std::string>(b, e, "--store", "both");
 
-        if (key == "-h" || key == "--help") { usage(argv[0]); return 0; }
-        else if (key == "-n" || key == "--size") cfg.nx = cfg.ny = as_size();
-        else if (key == "--nx") cfg.nx = as_size();
-        else if (key == "--ny") cfg.ny = as_size();
-        else if (key == "--lda") cfg.lda = as_size();
-        else if (key == "-t" || key == "--threads") cfg.threads = as_int();
-        else if (key == "-i" || key == "--iters") cfg.iters = as_int();
-        else if (key == "--trials") cfg.trials = as_int();
-        else if (key == "-q" || key == "--quiet") cfg.quiet = true;
-        else if (key == "-s" || key == "--stencil") {
-            auto v = value();
-            if (v == "jacobi") cfg.stencil = Stencil::Jacobi;
-            else if (v == "nine") cfg.stencil = Stencil::Nine;
-            else bad("stencil", v);
-        }
-        else if (key == "-b" || key == "--backend") {
-            auto v = value();
-            if (v == "omp-for") cfg.backend = Backend::OmpFor;
-            else if (v == "omp-spmd") cfg.backend = Backend::OmpSpmd;
-            else if (v == "gcd") cfg.backend = Backend::Gcd;
-            else bad("backend", v);
-        }
-        else if (key == "--store") {
-            auto v = value();
-            if (v == "std") { cfg.want_std = true; cfg.want_nt = false; }
-            else if (v == "nt") { cfg.want_std = false; cfg.want_nt = true; }
-            else if (v == "both") { cfg.want_std = cfg.want_nt = true; }
-            else bad("store", v);
-        }
-        else bad("option", a);
-    }
+    if      (stencil == "jacobi") cfg.stencil = Stencil::Jacobi;
+    else if (stencil == "nine")   cfg.stencil = Stencil::Nine;
+    else { std::fprintf(stderr, "error: unknown stencil '%s'\n", stencil.c_str()); return EXIT_FAILURE; }
+
+    if      (backend == "omp-for") cfg.backend = Backend::OmpFor;
+    else if (backend == "gcd")     cfg.backend = Backend::Gcd;
+    else { std::fprintf(stderr, "error: unknown backend '%s'\n", backend.c_str()); return EXIT_FAILURE; }
+
+    if      (store == "std")  { cfg.want_std = true;  cfg.want_nt = false; }
+    else if (store == "nt")   { cfg.want_std = false; cfg.want_nt = true; }
+    else if (store == "both") { cfg.want_std = true;  cfg.want_nt = true; }
+    else { std::fprintf(stderr, "error: unknown store '%s'\n", store.c_str()); return EXIT_FAILURE; }
 
     if (cfg.ny == 0) cfg.ny = cfg.nx;
     if (cfg.nx < 3 || cfg.ny < 3) { std::fprintf(stderr, "error: grid must be at least 3x3\n"); return EXIT_FAILURE; }
@@ -518,7 +478,7 @@ int main(int argc, char **argv) {
     if (!cfg.quiet)
         std::printf("grid %zu x %zu  lda %zu  (%.1f MB/array)  stencil=%s backend=%s threads=%d\n",
                     cfg.nx, cfg.ny, cfg.lda,
-                    static_cast<double>(cfg.lda * cfg.ny * sizeof(double)) / (1024.0 * 1024.0),
+                    double(cfg.lda * cfg.ny * sizeof(double)) / (1024.0 * 1024.0),
                     name_of(cfg.stencil), name_of(cfg.backend), cfg.threads);
 
     if (cfg.want_std) run_one(cfg, Store::Standard);

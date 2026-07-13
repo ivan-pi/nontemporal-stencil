@@ -5,7 +5,7 @@
 # Tunables (environment overrides):
 #   THREADS   worker threads / GCD bands           (default 6 = M2 Pro P-cores)
 #   STENCILS  space-separated: jacobi nine          (default both)
-#   BACKENDS  space-separated: omp-for omp-spmd gcd  (default omp-for)
+#   BACKENDS  space-separated: omp-for gcd            (default omp-for)
 #   SIZES     space-separated grid sizes             (default 2^7 .. ~2^13.75)
 #   DAT       output file                            (default results.dat)
 set -euo pipefail
