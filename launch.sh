@@ -17,10 +17,8 @@ THREADS=${THREADS:-6}
 STENCILS=${STENCILS:-"jacobi nine"}
 BACKENDS=${BACKENDS:-"omp-for"}
 
-# Keep the streaming workload on the performance cores and give each thread one
-# contiguous band (static). Flip OMP_SCHEDULE=dynamic to see it get worse.
+# Pin the streaming workload to the performance cores.
 export OMP_NUM_THREADS="$THREADS"
-export OMP_SCHEDULE="${OMP_SCHEDULE:-static}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
 
@@ -30,7 +28,7 @@ export OMP_PLACES="${OMP_PLACES:-cores}"
 SIZES=${SIZES:-$(awk 'BEGIN{for(i=7;i<=13.75;i+=0.25) printf "%d ", 2**i}')}
 
 echo "# stencil backend store nx ny threads iters trials time_us eff_gbs dram_gbs mlups" > "$DAT"
-echo "Sweeping: stencils=[$STENCILS] backends=[$BACKENDS] threads=$THREADS schedule=$OMP_SCHEDULE"
+echo "Sweeping: stencils=[$STENCILS] backends=[$BACKENDS] threads=$THREADS"
 echo "-------------------------------------------------------------------------------"
 for s in $STENCILS; do
   for b in $BACKENDS; do
