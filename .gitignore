@@ -1,0 +1,9 @@
+# Build artifacts
+stencil
+*.o
+*.s
+
+# Benchmark output
+results.dat
+results.png
+*.dat
