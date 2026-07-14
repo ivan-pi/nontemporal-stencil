@@ -1,0 +1,8 @@
+# Build products
+dcopy_bench
+*.o
+*.mod
+
+# Jacobi benchmark outputs
+jacobi
+cache_wall.dat

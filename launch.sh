@@ -8,7 +8,7 @@ ITERATIONS=100
 
 if [ ! -f "$EXEC" ]; then
     echo "Compiling..."
-    clang -O3 -Xpreprocessor -fopenmp -lomp -ffast-math -mcpu=apple-m2 nontemporal_stencil.c -o $EXEC
+    clang -O3 -Xpreprocessor -fopenmp -lomp -ffast-math -mcpu=apple-m2 jacobi.c -o $EXEC
 fi
 
 echo "# Kernel NX NY Iterations Time(us/step) Bandwidth(GB/s)" > "$DAT_FILE"
