@@ -1,6 +1,7 @@
-# Bandwidth vs. problem size for standard vs. non-temporal stores.
-#   gnuplot plot.gp            -> results.png
-# Reads results.dat produced by launch.sh. Columns:
+# Plots from results.dat (produced by launch.sh):
+#   results.png             bandwidth + modelled traffic, std vs nt, per stencil
+#   results_throughput.png  throughput (MLUP/s), all four series on one axes
+# Columns:
 #   1 stencil 2 backend 3 store 4 nx 5 ny 6 threads 7 iters 8 trials
 #   9 time_us 10 eff_gbs 11 dram_gbs 12 mlups
 
@@ -52,4 +53,29 @@ plot std("nine") using 4:11 w lp lw 2 pt 7 ps 0.7 title "standard (3N)", \
      nt("nine")  using 4:11 w lp lw 2 pt 5 ps 0.7 title "non-temporal (2N)"
 
 unset multiplot
+set output                            # finish results.png
+
+# ---------------------------------------------------------------------------
+#  Second figure: throughput (MLUP/s), all four series on one axes.
+#  Colour distinguishes the stencil; line style (solid/dashed) the store.
+# ---------------------------------------------------------------------------
+set terminal pngcairo size 900,600 font "Helvetica,12"
+set output "results_throughput.png"
+
+set title "Stencil throughput (Apple M2 Pro)"
+set ylabel "Throughput (MLUP/s)"
+set key top left box opaque samplen 2.0
+# (log-x, xlabel, grid and the SLC marker from above still apply.)
+
+#                    colour            style       stencil, store
+set style line 11 lc rgb "#0072B2" lw 2 dt 1 pt 7 ps 0.7   # Jacobi, standard
+set style line 12 lc rgb "#0072B2" lw 2 dt 2 pt 5 ps 0.7   # Jacobi, non-temporal
+set style line 13 lc rgb "#D55E00" lw 2 dt 1 pt 7 ps 0.7   # 9-point, standard
+set style line 14 lc rgb "#D55E00" lw 2 dt 2 pt 5 ps 0.7   # 9-point, non-temporal
+
+plot std("jacobi") using 4:12 w lp ls 11 title "Jacobi, standard", \
+     nt("jacobi")  using 4:12 w lp ls 12 title "Jacobi, non-temporal", \
+     std("nine")   using 4:12 w lp ls 13 title "9-point, standard", \
+     nt("nine")    using 4:12 w lp ls 14 title "9-point, non-temporal"
+
 set output
